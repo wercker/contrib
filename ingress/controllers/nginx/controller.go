@@ -22,7 +22,6 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +36,6 @@ import (
 	"k8s.io/kubernetes/pkg/controller/framework"
 	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/intstr"
 	"k8s.io/kubernetes/pkg/watch"
 
 	"k8s.io/contrib/ingress/controllers/nginx/nginx"
@@ -441,83 +439,7 @@ func (lbc *loadBalancerController) getUDPServices() []*nginx.Location {
 
 func (lbc *loadBalancerController) getStreamServices(data map[string]string, proto api.Protocol) []*nginx.Location {
 	var svcs []*nginx.Location
-	// k -> port to expose in nginx
-	// v -> <namespace>/<service name>:<port from service to be used>
-	for k, v := range data {
-		port, err := strconv.Atoi(k)
-		if err != nil {
-			glog.Warningf("%v is not valid as a TCP port", k)
-			continue
-		}
-
-		// this ports are required for NGINX
-		if k == "80" || k == "443" || k == "8181" {
-			glog.Warningf("port %v cannot be used for TCP or UDP services. Is reserved for NGINX", k)
-			continue
-		}
-
-		nsSvcPort := strings.Split(v, ":")
-		if len(nsSvcPort) != 2 {
-			glog.Warningf("invalid format (namespace/name:port) '%v'", k)
-			continue
-		}
-
-		nsName := nsSvcPort[0]
-		svcPort := nsSvcPort[1]
-
-		svcNs, svcName, err := parseNsName(nsName)
-		if err != nil {
-			glog.Warningf("%v", err)
-			continue
-		}
-
-		svcObj, svcExists, err := lbc.svcLister.Store.GetByKey(nsName)
-		if err != nil {
-			glog.Warningf("error getting service %v: %v", nsName, err)
-			continue
-		}
-
-		if !svcExists {
-			glog.Warningf("service %v was not found", nsName)
-			continue
-		}
-
-		svc := svcObj.(*api.Service)
-
-		var endps []nginx.UpstreamServer
-		targetPort, err := strconv.Atoi(svcPort)
-		if err != nil {
-			for _, sp := range svc.Spec.Ports {
-				if sp.Name == svcPort {
-					endps = lbc.getEndpoints(svc, sp.TargetPort, proto)
-					break
-				}
-			}
-		} else {
-			// we need to use the TargetPort (where the endpoints are running)
-			for _, sp := range svc.Spec.Ports {
-				if sp.Port == int32(targetPort) {
-					endps = lbc.getEndpoints(svc, sp.TargetPort, proto)
-					break
-				}
-			}
-		}
-
-		// tcp upstreams cannot contain empty upstreams and there is no
-		// default backend equivalent for TCP
-		if len(endps) == 0 {
-			glog.Warningf("service %v/%v does no have any active endpoints", svcNs, svcName)
-			continue
-		}
-
-		svcs = append(svcs, &nginx.Location{
-			Path: k,
-			Upstream: nginx.Upstream{
-				Name:     fmt.Sprintf("%v-%v-%v", svcNs, svcName, port),
-				Backends: endps,
-			},
-		})
-	}
+	glog.Warningf("stream service functionality disabled")
 
 	return svcs
 }
@@ -542,7 +464,7 @@ func (lbc *loadBalancerController) getDefaultUpstream() *nginx.Upstream {
 
 	svc := svcObj.(*api.Service)
 
-	endps := lbc.getEndpoints(svc, svc.Spec.Ports[0].TargetPort, api.ProtocolTCP)
+	endps := lbc.getEndpoints(svc, svc.Spec.Ports[0].Port, api.ProtocolTCP)
 	if len(endps) == 0 {
 		glog.Warningf("service %v does no have any active endpoints", svcKey)
 		upstream.Backends = append(upstream.Backends, nginx.NewDefaultServer())
@@ -693,7 +615,7 @@ func (lbc *loadBalancerController) createUpstreams(data []interface{}) map[strin
 				for _, servicePort := range svc.Spec.Ports {
 					// targetPort could be a string, use the name or the port (int)
 					if strconv.Itoa(int(servicePort.Port)) == bp || servicePort.TargetPort.String() == bp || servicePort.Name == bp {
-						endps := lbc.getEndpoints(svc, servicePort.TargetPort, api.ProtocolTCP)
+						endps := lbc.getEndpoints(svc, servicePort.Port, api.ProtocolTCP)
 						if len(endps) == 0 {
 							glog.Warningf("service %v does no have any active endpoints", svcKey)
 						}
@@ -801,69 +723,12 @@ func (lbc *loadBalancerController) getPemsFromIngress(data []interface{}) map[st
 }
 
 // getEndpoints returns a list of <endpoint ip>:<port> for a given service/target port combination.
-func (lbc *loadBalancerController) getEndpoints(s *api.Service, servicePort intstr.IntOrString, proto api.Protocol) []nginx.UpstreamServer {
-	glog.V(3).Infof("getting endpoints for service %v/%v and port %v", s.Namespace, s.Name, servicePort.String())
-	ep, err := lbc.endpLister.GetServiceEndpoints(s)
-	if err != nil {
-		glog.Warningf("unexpected error obtaining service endpoints: %v", err)
-		return []nginx.UpstreamServer{}
-	}
-
+func (lbc *loadBalancerController) getEndpoints(s *api.Service, servicePort int32, proto api.Protocol) []nginx.UpstreamServer {
+	glog.V(3).Infof("getting endpoints for service %v/%v and port %d", s.Namespace, s.Name, servicePort)
 	upsServers := []nginx.UpstreamServer{}
 
-	for _, ss := range ep.Subsets {
-		for _, epPort := range ss.Ports {
-
-			if !reflect.DeepEqual(epPort.Protocol, proto) {
-				continue
-			}
-
-			var targetPort int32
-			switch servicePort.Type {
-			case intstr.Int:
-				if int(epPort.Port) == servicePort.IntValue() {
-					targetPort = epPort.Port
-				}
-			case intstr.String:
-				namedPorts := s.ObjectMeta.Annotations
-				val, ok := namedPortMapping(namedPorts).getPort(servicePort.StrVal)
-				if ok {
-					port, err := strconv.Atoi(val)
-					if err != nil {
-						glog.Warningf("%v is not valid as a port", val)
-						continue
-					}
-
-					targetPort = int32(port)
-				} else {
-					newnp, err := lbc.checkSvcForUpdate(s)
-					if err != nil {
-						glog.Warningf("error mapping service ports: %v", err)
-						continue
-					}
-					val, ok := namedPortMapping(newnp).getPort(servicePort.StrVal)
-					if ok {
-						port, err := strconv.Atoi(val)
-						if err != nil {
-							glog.Warningf("%v is not valid as a port", val)
-							continue
-						}
-
-						targetPort = int32(port)
-					}
-				}
-			}
-
-			if targetPort == 0 {
-				continue
-			}
-
-			for _, epAddress := range ss.Addresses {
-				ups := nginx.UpstreamServer{Address: epAddress.IP, Port: fmt.Sprintf("%v", targetPort)}
-				upsServers = append(upsServers, ups)
-			}
-		}
-	}
+	ups := nginx.UpstreamServer{Address: s.Spec.ClusterIP, Port: strconv.Itoa(int(servicePort))}
+	upsServers = append(upsServers, ups)
 
 	glog.V(3).Infof("endpoints found: %v", upsServers)
 	return upsServers
